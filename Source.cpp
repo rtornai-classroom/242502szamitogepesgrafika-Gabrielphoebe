@@ -213,8 +213,7 @@ void display(GLFWwindow* window, double currentTime) {
     glUseProgram(circleRenderingProgram);
     glUniform1i(colorSwapLocation, shouldSwapColors); // This controls the color swap
 
-    bool tochLine = (std::abs(circleYaxis - lineYAxis) < 0.1f) &&
-        (std::abs(circleXaxis) < (lineWidth / 2.0f + 0.1f));
+ 
 
 
     drawCircle();
