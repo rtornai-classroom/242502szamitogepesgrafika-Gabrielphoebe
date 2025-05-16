@@ -1,370 +1,534 @@
-﻿#include <array>
-#include <fstream>
-#include <GL/glew.h>
+﻿#include <GL/glew.h>
 #include <GLFW/glfw3.h>
-#include <GLM/glm.hpp>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <iostream>
-#include <math.h>
-#include <string>
 #include <vector>
-#include <GLM/gtc/type_ptr.hpp>
-using namespace std;
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
-static std::vector<glm::vec3> control_points = {
-    glm::vec3(-0.5f, -0.5f, 0.0f),
-    glm::vec3(-0.25f, 0.5f, 0.0f),
-    glm::vec3(0.25f, 0.5f, 0.0f),
-    glm::vec3(0.5f, -0.5f, 0.0f),
-};
+// Shader sources
+const char* vertexShaderSource = R"glsl(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aTexCoord;
 
-unsigned int factorial(unsigned int n) {
-    return (n == 1 || n == 0) ? 1 : factorial(n - 1) * n;
+out vec3 FragPos;
+out vec3 Normal;
+out vec2 TexCoord;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main()
+{
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    TexCoord = aTexCoord;
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
 }
+)glsl";
 
-unsigned int binomial_coefficient(unsigned int n, unsigned int k) {
-    return factorial(n) / (factorial(k) * factorial(n - k));
-}
+const char* fragmentShaderSource = R"glsl(
+#version 330 core
+out vec4 FragColor;
 
-glm::vec3 bezier_point(const std::vector<glm::vec3>& points, float t) {
-    int degree = points.size() - 1; // Degree of the curve
-    glm::vec3 point(0.0f);
+in vec3 FragPos;
+in vec3 Normal;
+in vec2 TexCoord;
 
-    for (int i = 0; i <= degree; ++i) {
-        float coeff = binomial_coefficient(degree, i) * pow(1 - t, degree - i) * pow(t, i);
-        point += points[i] * coeff;
+uniform vec3 lightPos;
+uniform vec3 lightColor;
+uniform vec3 viewPos;
+uniform bool lightOn;
+uniform bool magentaOn;
+uniform sampler2D sunTexture;
+uniform bool isLightSource;
+
+void main()
+{
+    if (isLightSource) {
+        FragColor = texture(sunTexture, TexCoord);
+        if (FragColor.a < 0.1) discard; // Discard transparent pixels
+        if (FragColor.r < 0.1 && FragColor.g < 0.1 && FragColor.b < 0.1) {
+            FragColor = vec4(1.0, 1.0, 0.0, 1.0); // Fallback yellow color
+        }
+        return;
     }
 
-    return point;
-}
-
-#define num_vertex_buffers 1
-#define num_vertex_arrays 1
-GLuint VBO[num_vertex_buffers];
-GLuint VAO[num_vertex_arrays];
-
-int width = 600;
-int height = 600;
-char title[] = "Bezier Curve";
-
-GLFWwindow* window = nullptr;
-GLuint rendering_program;
-GLint dragged_point = -1;
-
-void print_shader_log(GLuint shader) {
-    int length = 0;
-    int chars_written = 0;
-    char* log = nullptr;
-
-    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
-
-    if (length > 0) {
-        log = (char*)malloc(length);
-
-        glGetShaderInfoLog(shader, length, &chars_written, log);
-        cout << "Shader Info Log: " << log << endl;
-        free(log);
+    vec3 objectColor = magentaOn ? vec3(1.0, 0.0, 1.0) : vec3(1.0, 1.0, 1.0);
+    
+    if (lightOn) {
+        // Ambient
+        float ambientStrength = 0.1;
+        vec3 ambient = ambientStrength * lightColor;
+        
+        // Diffuse 
+        vec3 norm = normalize(Normal);
+        vec3 lightDir = normalize(lightPos - FragPos);
+        float diff = max(dot(norm, lightDir), 0.0);
+        vec3 diffuse = diff * lightColor;
+        
+        // Specular
+        float specularStrength = 0.5;
+        vec3 viewDir = normalize(viewPos - FragPos);
+        vec3 reflectDir = reflect(-lightDir, norm);  
+        float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
+        vec3 specular = specularStrength * spec * lightColor;
+        
+        vec3 result = (ambient + diffuse + specular) * objectColor;
+        FragColor = vec4(result, 1.0);
+    } else {
+        FragColor = vec4(objectColor * 0.2, 1.0);
     }
 }
+)glsl";
 
-void print_program_log(int prog) {
-    int length = 0;
-    int chars_written = 0;
-    char* log = nullptr;
+// Window dimensions
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 800;
 
-    glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &length);
+// Camera parameters
 
-    if (length > 0) {
-        log = (char*)malloc(length);
+float cameraHeight = 0.0f;
+float cameraRadius = 5.0f;
+float cameraAngle = 0.0f;
+glm::vec3 cameraFront = glm::vec3(0.0f, -0.3f, -1.0f);
+glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+glm::vec3 cameraPos = glm::vec3(0.0f, 2.0f, 6.0f);
 
-        glGetProgramInfoLog(prog, length, &chars_written, log);
-        cout << "Program Info Log: " << log << endl;
-        free(log);
+// Light parameters
+glm::vec3 lightPos = glm::vec3(2.0f, 1.0f, 0.0f);
+glm::vec3 lightColor = glm::vec3(1.0f, 1.0f, 0.0f);
+float lightAngle = 0.0f;
+float lightOrbitRadius = 3.50f;  // Increased orbit radius
+float lightHeight = 2.0f;
+bool lightOn = true;
+bool lKeyPressed = false;
+
+// Material parameters
+bool magentaOn = false;
+bool mKeyPressed = false;
+
+// Mouse parameters
+float lastX = SCR_WIDTH / 2.0f;
+float lastY = SCR_HEIGHT / 2.0f;
+bool firstMouse = true;
+
+// Timing
+float deltaTime = 0.0f;
+float lastFrame = 0.0f;
+
+// Cube parameters
+const float CUBE_SIZE = 0.5f;
+const float CUBE_SPACING = CUBE_SIZE * 2.5f; // Slightly more spacing
+
+
+unsigned int loadTexture(const char* path) {
+    unsigned int textureID;
+    glGenTextures(1, &textureID);
+
+    int width, height, nrChannels;
+    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 0);
+
+    if (data) {
+        GLenum format;
+        if (nrChannels == 1)
+            format = GL_RED;
+        else if (nrChannels == 3)
+            format = GL_RGB;
+        else if (nrChannels == 4)
+            format = GL_RGBA;
+
+        glBindTexture(GL_TEXTURE_2D, textureID);
+        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        stbi_image_free(data);
+        std::cout << "Loaded texture successfully: " << path << std::endl;
     }
+    else {
+        std::cout << "Failed to load texture: " << path << std::endl;
+        stbi_image_free(data);
+        return 0;
+    }
+
+    return textureID;
 }
 
-string read_shader_source(const char* file_path) {
-    ifstream file_stream(file_path, ios::in);
-    string content;
-    string line;
+void createSphere(std::vector<float>& vertices, std::vector<unsigned int>& indices, float radius = 1.0f, unsigned int sectorCount = 36, unsigned int stackCount = 18) {
+    const float PI = 3.1415926f;
+    float x, y, z, xy;
+    float nx, ny, nz, lengthInv = 1.0f / radius;
+    float s, t;
 
-    if (!file_stream.is_open()) {
-        cerr << "Failed to open shader file: " << file_path << endl;
-        return "";
-    }
+    float sectorStep = 2 * PI / sectorCount;
+    float stackStep = PI / stackCount;
+    float sectorAngle, stackAngle;
 
-    while (getline(file_stream, line)) {
-        content += line + "\n";
-    }
+    for (unsigned int i = 0; i <= stackCount; ++i) {
+        stackAngle = PI / 2 - i * stackStep;
+        xy = radius * cosf(stackAngle);
+        z = radius * sinf(stackAngle);
 
-    file_stream.close();
+        for (unsigned int j = 0; j <= sectorCount; ++j) {
+            sectorAngle = j * sectorStep;
 
-    return content;
-}
+            x = xy * cosf(sectorAngle);
+            y = xy * sinf(sectorAngle);
+            vertices.push_back(x);
+            vertices.push_back(y);
+            vertices.push_back(z);
 
-GLuint create_shader_program() {
-    string vert_shader_str = read_shader_source("vertexShader.glsl");
-    string frag_shader_str = read_shader_source("fragmentShader.glsl");
+            nx = x * lengthInv;
+            ny = y * lengthInv;
+            nz = z * lengthInv;
+            vertices.push_back(nx);
+            vertices.push_back(ny);
+            vertices.push_back(nz);
 
-    const char* vert_shader_src = vert_shader_str.c_str();
-    const char* frag_shader_src = frag_shader_str.c_str();
-
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-
-    glShaderSource(vertex_shader, 1, &vert_shader_src, NULL);
-    glShaderSource(fragment_shader, 1, &frag_shader_src, NULL);
-
-    glCompileShader(vertex_shader);
-    GLint vert_compiled;
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &vert_compiled);
-    if (vert_compiled != 1) {
-        cout << "Vertex compilation failed." << endl;
-        print_shader_log(vertex_shader);
-    }
-
-    glCompileShader(fragment_shader);
-    GLint frag_compiled;
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &frag_compiled);
-    if (frag_compiled != 1) {
-        cout << "Fragment compilation failed." << endl;
-        print_shader_log(fragment_shader);
-    }
-
-    GLuint vf_program = glCreateProgram();
-
-    glAttachShader(vf_program, vertex_shader);
-    glAttachShader(vf_program, fragment_shader);
-
-    glLinkProgram(vf_program);
-    GLint linked;
-    glGetProgramiv(vf_program, GL_LINK_STATUS, &linked);
-    if (linked != 1) {
-        cout << "Shader linking failed." << endl;
-        print_program_log(vf_program);
-    }
-
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-
-    return vf_program;
-}
-
-GLfloat distance_squared(glm::vec3 P1, glm::vec3 P2) {
-    GLfloat dx = P1.x - P2.x;
-    GLfloat dy = P1.y - P2.y;
-    return dx * dx + dy * dy;
-}
-
-GLint get_active_point(vector<glm::vec3> p, GLfloat sensitivity, GLfloat x, GLfloat y) {
-    GLfloat s = sensitivity * sensitivity; // Square the sensitivity threshold
-    GLint size = p.size();
-    GLint closest_point_index = -1;
-    GLfloat min_distance = std::numeric_limits<GLfloat>::max();
-
-    // Convert mouse position to normalized device coordinates
-    GLfloat x_norm = x / static_cast<GLfloat>(width) * 2.0f - 1.0f;
-    GLfloat y_norm = y / static_cast<GLfloat>(height) * 2.0f - 1.0f;
-
-    glm::vec3 mouse_pos = glm::vec3(x_norm, y_norm, 0.0f);
-
-    // Iterate through all points and find the closest one
-    for (GLint i = 0; i < size; i++) {
-        GLfloat distance = distance_squared(mouse_pos, p[i]);
-        if (distance < min_distance && distance < s) {
-            min_distance = distance;
-            closest_point_index = i;
+            s = (float)j / sectorCount;
+            t = (float)i / stackCount;
+            vertices.push_back(s);
+            vertices.push_back(t);
         }
     }
 
-    return closest_point_index;
-}
+    unsigned int k1, k2;
+    for (unsigned int i = 0; i < stackCount; ++i) {
+        k1 = i * (sectorCount + 1);
+        k2 = k1 + sectorCount + 1;
 
-void render_scene() {
-    glClear(GL_COLOR_BUFFER_BIT);
-    glPointSize(10.0);
-    glBindVertexArray(VAO[0]);
-    glUseProgram(rendering_program);
+        for (unsigned int j = 0; j < sectorCount; ++j, ++k1, ++k2) {
+            if (i != 0) {
+                indices.push_back(k1);
+                indices.push_back(k2);
+                indices.push_back(k1 + 1);
+            }
 
-    // Draw the control polygon sides in blue
-    glUniform4f(glGetUniformLocation(rendering_program, "pointColor"), 0.0f, 0.0f, 1.0f, 1.0f);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-    glBufferData(GL_ARRAY_BUFFER, control_points.size() * sizeof(glm::vec3), &control_points[0], GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, NULL);
-    glEnableVertexAttribArray(0);
-    glDrawArrays(GL_LINE_STRIP, 0, control_points.size());
-
-    // Draw the Bézier
-    // Draw the Bézier curve points in red
-    glUniform4f(glGetUniformLocation(rendering_program, "pointColor"), 1.0f, 0.0f, 0.0f, 1.0f);
-    std::vector<glm::vec3> curve_points;
-    for (int i = 0; i < control_points.size(); ++i) {
-        curve_points.push_back(control_points[i]);
-    }
-    glBufferData(GL_ARRAY_BUFFER, curve_points.size() * sizeof(glm::vec3), curve_points.data(), GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, NULL);
-    glEnableVertexAttribArray(0);
-    glDrawArrays(GL_POINTS, 0, curve_points.size());
-
-    // Draw the Bézier curve
-    glUniform4f(glGetUniformLocation(rendering_program, "pointColor"), 0.0f, 1.0f, 0.0f, 1.0f);
-    curve_points.clear();
-    for (int i = 0; i <= 100; ++i) {
-        float t = static_cast<float>(i) / 100.0f;
-        curve_points.push_back(bezier_point(control_points, t));
-    }
-    glBufferData(GL_ARRAY_BUFFER, curve_points.size() * sizeof(glm::vec3), curve_points.data(), GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, NULL);
-    glEnableVertexAttribArray(0);
-    glDrawArrays(GL_LINE_STRIP, 0, curve_points.size());
-}
-
-void setup() {
-    rendering_program = create_shader_program();
-    glGenVertexArrays(num_vertex_arrays, VAO);
-    glBindVertexArray(VAO[0]);
-    glGenBuffers(num_vertex_buffers, VBO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-    glBufferData(GL_ARRAY_BUFFER, control_points.size() * sizeof(glm::vec3), &control_points[0], GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, NULL);
-    glEnableVertexAttribArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindVertexArray(0);
-}
-
-void window_reshape_callback(GLFWwindow* window, int w, int h) {
-    glViewport(0, 0, w, h);
-    width = w;
-    height = h;
-}
-
-bool left_mouse_button_pressed = false;
-
-void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-        double x, y;
-
-        glfwGetCursorPos(window, &x, &y);
-
-        // Check if there is an active point being dragged
-        dragged_point = get_active_point(control_points, 0.1f, x, height - y);
-
-        if (dragged_point >= 0) {
-            // If there is an active point being dragged, set the flag for dragging
-            left_mouse_button_pressed = true;
-        }
-        else {
-            // If not, add a new control point at the cursor position
-            float x_norm = static_cast<float>(x) / static_cast<float>(width) * 2.0f - 1.0f;
-            float y_norm = static_cast<float>(height - y) / static_cast<float>(height) * 2.0f - 1.0f;
-            control_points.push_back(glm::vec3(x_norm, y_norm, 0.0f));
-
-            // Update the buffer data
-            glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-            glBufferData(GL_ARRAY_BUFFER, control_points.size() * sizeof(glm::vec3), &control_points[0], GL_STATIC_DRAW);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-            // Redraw the scene
-            render_scene();
+            if (i != (stackCount - 1)) {
+                indices.push_back(k1 + 1);
+                indices.push_back(k2);
+                indices.push_back(k2 + 1);
+            }
         }
     }
-    else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
-        double x, y;
+}
 
-        glfwGetCursorPos(window, &x, &y);
+void processInput(GLFWwindow* window) {
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
 
-        // Check if there is any point near the cursor position
-        int point_to_remove = get_active_point(control_points, 0.1f, x, height - y);
+    float cameraSpeed = 2.5f * deltaTime;
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        cameraHeight += cameraSpeed;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        cameraHeight -= cameraSpeed;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        cameraAngle -= cameraSpeed;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        cameraAngle += cameraSpeed;
 
-        if (point_to_remove >= 0) {
-            // If a point is found near the cursor position, remove it
-            control_points.erase(control_points.begin() + point_to_remove);
-
-            // Update the buffer data
-            glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-            glBufferData(GL_ARRAY_BUFFER, control_points.size() * sizeof(glm::vec3), &control_points[0], GL_STATIC_DRAW);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-            // Redraw the scene
-            render_scene();
-        }
+    if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS && !lKeyPressed) {
+        lightOn = !lightOn;
+        lKeyPressed = true;
+        std::cout << "Light " << (lightOn ? "ON" : "OFF") << std::endl;
+    }
+    if (glfwGetKey(window, GLFW_KEY_L) == GLFW_RELEASE) {
+        lKeyPressed = false;
     }
 
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
-        dragged_point = -1;
-        left_mouse_button_pressed = false; // Reset the flag for dragging
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS && !mKeyPressed) {
+        magentaOn = !magentaOn;
+        mKeyPressed = true;
+        std::cout << "Magenta material " << (magentaOn ? "ON" : "OFF") << std::endl;
+    }
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_RELEASE) {
+        mKeyPressed = false;
     }
 }
 
-void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
-    if (dragged_point >= 0) {
-        // Invert y-axis
-        ypos = height - ypos;
-
-        // Convert mouse position to normalized device coordinates
-        float x_norm = static_cast<float>(xpos) / static_cast<float>(width) * 2.0f - 1.0f;
-        float y_norm = static_cast<float>(ypos) / static_cast<float>(height) * 2.0f - 1.0f;
-
-        // Update the position of the dragged control point
-        control_points[dragged_point] = glm::vec3(x_norm, y_norm, 0.0f);
-
-        // Update the buffer data
-        glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(glm::vec3) * control_points.size(), &control_points[0]);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-        render_scene();
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (firstMouse) {
+        lastX = xpos;
+        lastY = ypos;
+        firstMouse = false;
     }
-    else if (left_mouse_button_pressed) {
-        ypos = height - ypos;
 
-        float x_norm = static_cast<float>(xpos) / static_cast<float>(width) * 2.0f - 1.0f;
-        float y_norm = static_cast<float>(ypos) / static_cast<float>(height) * 2.0f - 1.0f;
+    float xoffset = xpos - lastX;
+    float yoffset = lastY - ypos;
+    lastX = xpos;
+    lastY = ypos;
 
-        control_points.push_back(glm::vec3(x_norm, y_norm, 0.0f));
+    float sensitivity = 0.1f;
+    xoffset *= sensitivity;
+    yoffset *= sensitivity;
 
-        // Dynamically adjust the degree of the Bézier curve based on the number of control points
-        // Degree = Number of Control Points - 1
-        GLint degree = control_points.size() - 1;
+    cameraAngle -= xoffset;
+    cameraHeight += yoffset;
 
-        // Update the buffer data
-        glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-        glBufferData(GL_ARRAY_BUFFER, control_points.size() * sizeof(glm::vec3), &control_points[0], GL_STATIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (cameraHeight > 89.0f)
+        cameraHeight = 89.0f;
+    if (cameraHeight < -89.0f)
+        cameraHeight = -89.0f;
+}
 
-        // Redraw the scene
-        render_scene();
+unsigned int createShaderProgram(const char* vertexSource, const char* fragmentSource) {
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexSource, NULL);
+    glCompileShader(vertexShader);
+
+    int success;
+    char infoLog[512];
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+        std::cerr << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
     }
+
+    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fragmentSource, NULL);
+    glCompileShader(fragmentShader);
+
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+        std::cerr << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+
+    unsigned int shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+
+    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+        std::cerr << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    return shaderProgram;
 }
 
 int main() {
     if (!glfwInit()) {
-        exit(EXIT_FAILURE);
+        std::cerr << "Failed to initialize GLFW" << std::endl;
+        return -1;
     }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-    window = glfwCreateWindow(width, height, title, NULL, NULL);
 
-    glfwMakeContextCurrent(window);
-    if (glewInit() != GLEW_OK) {
-        exit(EXIT_FAILURE);
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "3D Cubes with Lighting", NULL, NULL);
+    if (window == NULL) {
+        std::cerr << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
     }
 
-    glfwSetFramebufferSizeCallback(window, window_reshape_callback);
-    glfwSetMouseButtonCallback(window, mouse_button_callback);
-    glfwSetCursorPosCallback(window, cursor_position_callback);
+    glfwMakeContextCurrent(window);
+    glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    setup();
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "Failed to initialize GLEW" << std::endl;
+        return -1;
+    }
 
+    glEnable(GL_DEPTH_TEST);
+
+    unsigned int shaderProgram = createShaderProgram(vertexShaderSource, fragmentShaderSource);
+    unsigned int sunTexture = loadTexture("C:\\Users\\gabri\\OneDrive\\Documents\\sun.jpg");
+
+    if (sunTexture == 0) {
+        std::cerr << "Failed to load sun texture, using fallback color" << std::endl;
+    }
+
+    // Cube vertices with texture coordinates
+    float vertices[] = {
+        // Positions             // Normals           // Texture Coords
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 0.0f, 0.0f,
+         CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 1.0f, 0.0f,
+         CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 1.0f, 1.0f,
+         CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 1.0f, 1.0f,
+        -CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 0.0f, 1.0f,
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f,  0.0f, -1.0f, 0.0f, 0.0f,
+
+        -CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 0.0f, 0.0f,
+         CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 1.0f, 0.0f,
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 1.0f, 1.0f,
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 1.0f, 1.0f,
+        -CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 0.0f, 1.0f,
+        -CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f,  0.0f,  1.0f, 0.0f, 0.0f,
+
+        -CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE, -1.0f,  0.0f,  0.0f, 1.0f, 0.0f,
+        -CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE, -1.0f,  0.0f,  0.0f, 1.0f, 1.0f,
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE, -1.0f,  0.0f,  0.0f, 0.0f, 1.0f,
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE, -1.0f,  0.0f,  0.0f, 0.0f, 1.0f,
+        -CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE, -1.0f,  0.0f,  0.0f, 0.0f, 0.0f,
+        -CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE, -1.0f,  0.0f,  0.0f, 1.0f, 0.0f,
+
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  1.0f,  0.0f,  0.0f, 1.0f, 0.0f,
+         CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  1.0f,  0.0f,  0.0f, 1.0f, 1.0f,
+         CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  1.0f,  0.0f,  0.0f, 0.0f, 1.0f,
+         CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  1.0f,  0.0f,  0.0f, 0.0f, 1.0f,
+         CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  1.0f,  0.0f,  0.0f, 0.0f, 0.0f,
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  1.0f,  0.0f,  0.0f, 1.0f, 0.0f,
+
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f, -1.0f,  0.0f, 0.0f, 1.0f,
+         CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f, -1.0f,  0.0f, 1.0f, 1.0f,
+         CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f, -1.0f,  0.0f, 1.0f, 0.0f,
+         CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f, -1.0f,  0.0f, 1.0f, 0.0f,
+        -CUBE_SIZE, -CUBE_SIZE,  CUBE_SIZE,  0.0f, -1.0f,  0.0f, 0.0f, 0.0f,
+        -CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE,  0.0f, -1.0f,  0.0f, 0.0f, 1.0f,
+
+        -CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  1.0f,  0.0f, 0.0f, 1.0f,
+         CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  1.0f,  0.0f, 1.0f, 1.0f,
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  1.0f,  0.0f, 1.0f, 0.0f,
+         CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  1.0f,  0.0f, 1.0f, 0.0f,
+        -CUBE_SIZE,  CUBE_SIZE,  CUBE_SIZE,  0.0f,  1.0f,  0.0f, 0.0f, 0.0f,
+        -CUBE_SIZE,  CUBE_SIZE, -CUBE_SIZE,  0.0f,  1.0f,  0.0f, 0.0f, 1.0f
+    };
+
+    unsigned int cubeVAO, cubeVBO;
+    glGenVertexArrays(1, &cubeVAO);
+    glGenBuffers(1, &cubeVBO);
+
+    glBindVertexArray(cubeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, cubeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Light source sphere (bigger sun)
+    std::vector<float> sphereVertices;
+    std::vector<unsigned int> sphereIndices;
+    createSphere(sphereVertices, sphereIndices, 0.3f); // Bigger sphere for light source
+
+    unsigned int sphereVAO, sphereVBO, sphereEBO;
+    glGenVertexArrays(1, &sphereVAO);
+    glGenBuffers(1, &sphereVBO);
+    glGenBuffers(1, &sphereEBO);
+
+    glBindVertexArray(sphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, sphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, sphereVertices.size() * sizeof(float), sphereVertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sphereIndices.size() * sizeof(unsigned int), sphereIndices.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Main render loop
     while (!glfwWindowShouldClose(window)) {
-        render_scene();
+        float currentFrame = glfwGetTime();
+        deltaTime = currentFrame - lastFrame;
+        lastFrame = currentFrame;
+
+        processInput(window);
+
+        // Update camera position on cylinder
+        cameraPos.x = cameraRadius * cos(cameraAngle);
+        cameraPos.z = cameraRadius * sin(cameraAngle);
+        cameraPos.y = cameraHeight;
+
+        // Update light position (circular path around origin)
+        lightAngle += 0.5f * deltaTime;
+        lightPos.x = lightOrbitRadius * cos(lightAngle);
+        lightPos.z = lightOrbitRadius * sin(lightAngle);
+        lightPos.y = 1.0f; // Keep it slightly above the cubes
+
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Create view and projection matrices
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+        glm::mat4 view = glm::lookAt(cameraPos, glm::vec3(0.0f, 0.0f, 0.0f), cameraUp);
+
+        // Activate shader
+        glUseProgram(shaderProgram);
+
+        // Set shader uniforms
+        glUniform3fv(glGetUniformLocation(shaderProgram, "lightPos"), 1, glm::value_ptr(lightPos));
+        glUniform3fv(glGetUniformLocation(shaderProgram, "lightColor"), 1, glm::value_ptr(lightColor));
+        glUniform3fv(glGetUniformLocation(shaderProgram, "viewPos"), 1, glm::value_ptr(cameraPos));
+        glUniform1i(glGetUniformLocation(shaderProgram, "lightOn"), lightOn);
+        glUniform1i(glGetUniformLocation(shaderProgram, "magentaOn"), magentaOn);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+
+        float spacing = CUBE_SIZE * 2.0f; // Spacing equal to cube size
+
+        // Draw first cube (left)
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::translate(model, glm::vec3(-(CUBE_SIZE + spacing), 0.0f, 0.0f));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+        glUniform1i(glGetUniformLocation(shaderProgram, "isLightSource"), 0);
+        glBindVertexArray(cubeVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Draw second cube (center)
+        model = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Draw third cube (right)
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, glm::vec3(CUBE_SIZE + spacing, 0.0f, 0.0f));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Draw light source (sun)
+        if (sunTexture != 0) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sunTexture);
+            glUniform1i(glGetUniformLocation(shaderProgram, "sunTexture"), 0);
+        }
+
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, lightPos);
+        model = glm::scale(model, glm::vec3(0.5f)); // Bigger scale
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+        glUniform1i(glGetUniformLocation(shaderProgram, "isLightSource"), 1);
+        glBindVertexArray(sphereVAO);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    glfwDestroyWindow(window);
+    // Cleanup
+    glDeleteVertexArrays(1, &cubeVAO);
+    glDeleteBuffers(1, &cubeVBO);
+    glDeleteVertexArrays(1, &sphereVAO);
+    glDeleteBuffers(1, &sphereVBO);
+    glDeleteBuffers(1, &sphereEBO);
+    if (sunTexture != 0) {
+        glDeleteTextures(1, &sunTexture);
+    }
+    glDeleteProgram(shaderProgram);
+
     glfwTerminate();
-    exit(EXIT_SUCCESS);
+    return 0;
 }
